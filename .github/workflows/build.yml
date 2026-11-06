@@ -1,28 +1,155 @@
-name: Build APK
-
+name: Build APK TV 3 Trong 1
 on:
   push:
-    branches: [main, master]
   workflow_dispatch:
-
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Giai nen src.zip
-        run: unzip -o src.zip -d proj
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
-      - uses: gradle/actions/setup-gradle@v4
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: '8.9'
-      - name: Build debug APK
-        working-directory: proj
-        run: gradle assembleDebug --no-daemon
-      - uses: actions/upload-artifact@v4
+          gradle-version: 8.7
+      - name: Giai nen src.zip
+        run: |
+          mkdir -p work
+          unzip -q src.zip -d work
+      - name: Tai logo kenh VTV tu trang chu VTV
+        continue-on-error: true
+        run: |
+          pip install --quiet pillow
+          cat > fetch_logos.py <<'PYEOF'
+          # Tai logo kenh VTV tu trang chu VTV luc build. Loi o day khong lam hong ban build:
+          # kenh nao khong co logo thi app tu ve o mau kem ten kenh.
+          import io, os, re, sys, urllib.parse, urllib.request
+          from html import unescape
+
+          UA = "Mozilla/5.0 (Linux; Android 9; KD-65A8F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+          OUT = sys.argv[1]
+          os.makedirs(OUT, exist_ok=True)
+          START = os.environ.get("START_URLS", "https://vtvgo.vn/ https://vtv.vn/").split()
+          OVERRIDE = sys.argv[2] if len(sys.argv) > 2 else ""
+
+
+          def get(url):
+              req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "vi,en;q=0.8", "Referer": START[0]})
+              with urllib.request.urlopen(req, timeout=25) as r:
+                  return r.read()
+
+
+          def save(ch, data, src):
+              try:
+                  from PIL import Image
+                  im = Image.open(io.BytesIO(data))
+                  im.load()
+                  if im.width < 40 or im.height < 20:
+                      return False
+                  if im.mode not in ("RGB", "RGBA"):
+                      im = im.convert("RGBA")
+                  if im.width > 600:
+                      im = im.resize((600, max(1, round(im.height * 600 / im.width))))
+                  im.save(os.path.join(OUT, "vtv%d.webp" % ch), "WEBP", quality=90)
+                  print("OK  VTV%d <- %s (%dx%d)" % (ch, src, im.width, im.height))
+                  return True
+              except Exception as e:
+                  print("bo qua", src, e)
+                  return False
+
+
+          got = set()
+
+          # 1) neu co file logo_urls.txt (dong dang vtv1=https://...) thi dung truoc
+          if OVERRIDE and os.path.exists(OVERRIDE):
+              for line in open(OVERRIDE, encoding="utf-8"):
+                  m = re.match(r"\s*vtv(10|[1-9])\s*=\s*(\S+)", line, re.I)
+                  if m:
+                      try:
+                          if save(int(m.group(1)), get(m.group(2)), m.group(2)):
+                              got.add(int(m.group(1)))
+                      except Exception as e:
+                          print("loi tai", m.group(2), e)
+
+          # 2) quet trang chu va cac trang kenh
+          pages, queue = {}, list(START)
+          def page(u):
+              if u not in pages:
+                  try:
+                      pages[u] = get(u).decode("utf-8", "ignore")
+                  except Exception as e:
+                      print("khong tai duoc trang", u, e)
+                      pages[u] = ""
+              return pages[u]
+
+          for u in START:
+              h = page(u)
+              for m in re.finditer(r'href=["\']([^"\']+)["\']', h, re.I):
+                  link = urllib.parse.urljoin(u, unescape(m.group(1)))
+                  host = urllib.parse.urlparse(link).netloc
+                  if link.startswith("http") and "vtv" in host and re.search(r"vtv\d{1,2}", link, re.I) and link not in queue and len(queue) < 40:
+                      queue.append(link)
+
+          CH_RE = re.compile(r"vtv\s*[-_ ]?\s*(10|[1-9])(?!\d)", re.I)
+          cands = {}  # kenh -> [(diem, url)]
+          for u in queue:
+              h = page(u)
+              for tag in re.finditer(r"<img\b[^>]*>", h, re.I):
+                  t = tag.group(0)
+                  attrs = dict((a.lower(), unescape(v)) for a, v in re.findall(r'([\w:-]+)\s*=\s*["\']([^"\']*)["\']', t))
+                  src = attrs.get("data-src") or attrs.get("data-lazy-src") or attrs.get("data-original") or attrs.get("src") or ""
+                  if not src or src.startswith("data:"):
+                      continue
+                  url = urllib.parse.urljoin(u, src)
+                  path = urllib.parse.urlparse(url).path.lower()
+                  if path.endswith(".svg") or path.endswith(".gif"):
+                      continue
+                  fname = os.path.basename(path)
+                  text = " ".join([attrs.get("alt", ""), attrs.get("title", ""), fname])
+                  m = CH_RE.search(text)
+                  if not m:
+                      continue
+                  ch = int(m.group(1))
+                  score = 0
+                  if "logo" in (path + attrs.get("alt", "") + attrs.get("class", "")).lower():
+                      score += 3
+                  if re.match(r"^(logo)?[-_]?vtv\s*[-_]?%d(\D|$)" % ch, fname):
+                      score += 2
+                  if path.endswith((".png", ".webp")):
+                      score += 1
+                  if score >= 2:
+                      cands.setdefault(ch, []).append((score, url))
+
+          for ch in range(1, 11):
+              if ch in got:
+                  continue
+              seen = set()
+              for _, url in sorted(cands.get(ch, []), key=lambda x: -x[0]):
+                  if url in seen:
+                      continue
+                  seen.add(url)
+                  try:
+                      if save(ch, get(url), url):
+                          got.add(ch)
+                          break
+                  except Exception as e:
+                      print("loi tai", url, e)
+
+          print("Da lay logo cho:", ", ".join("VTV%d" % c for c in sorted(got)) or "(khong co)")
+          print("Thieu:", ", ".join("VTV%d" % c for c in range(1, 11) if c not in got) or "(khong thieu)")
+          PYEOF
+          python3 fetch_logos.py work/app/src/main/assets/logos logo_urls.txt
+      - name: Build
+        working-directory: work
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Doi ten APK
+        run: cp work/app/build/outputs/apk/debug/app-debug.apk TV3TrongMot.apk
+      - uses: softprops/action-gh-release@v2
         with:
-          name: TV3-apk
-          path: proj/app/build/outputs/apk/debug/app-debug.apk
+          tag_name: tv3-${{ github.run_number }}
+          name: TV 3 Trong 1 ${{ github.run_number }}
+          files: TV3TrongMot.apk
